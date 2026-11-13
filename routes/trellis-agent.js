@@ -98,15 +98,17 @@ function pushNotification(state, agent, { type, boardId, cardId, cardTitle, text
   if (state.notifications.length > 50) state.notifications = state.notifications.slice(0, 50);
 }
 
-// Compact card view for list/board reads (drops bulky attachment blobs).
+// Compact card view for list/board reads (attachments reduced to a count).
 function cardSummary(c) {
   return {
     id: c.id, title: c.title, description: c.description || '',
     position: c.position, labels: c.labels || [],
     dueDate: c.dueDate || null, dueDone: !!c.dueDone,
     members: c.members || [], origin: c.origin || null, createdAt: c.createdAt || null,
+    createdBy: c.createdBy || 'u1',
     checklistCount: (c.checklists || []).length,
     commentCount: (c.comments || []).length,
+    attachmentCount: (c.attachments || []).length,
   };
 }
 
@@ -185,6 +187,83 @@ router.get('/cards/:cardId', async (req, res, next) => {
 });
 
 // --- writes (atomic) ----------------------------------------------------
+
+// POST /boards — create a project board so an agent can set up a new project's
+// Kanban without the UI. Idempotent by title (case-insensitive): an existing
+// board is returned with 200 and left untouched, a new one comes back 201.
+// body: { title, lists? } — lists defaults to the house columns that
+// feature-card.py resolves by name: finished work waits in QC, deployed is done.
+const DEFAULT_LISTS = ['backlog', 'to do', 'doing', 'QC', 'done'];
+
+function boardIndexEntry(b) {
+  return {
+    id: b.id, title: b.title,
+    lists: (b.lists || []).slice().sort((x, y) => x.position - y.position)
+      .map(l => ({ id: l.id, title: l.title, position: l.position, cardCount: (l.cards || []).length })),
+  };
+}
+
+router.post('/boards', async (req, res, next) => {
+  const { title, lists } = req.body || {};
+  const name = String(title || '').trim();
+  if (!name) return badRequest(res, 'title is required');
+  if (lists !== undefined && (!Array.isArray(lists) || !lists.length || lists.some(l => !String(l || '').trim()))) {
+    return badRequest(res, 'lists must be a non-empty array of titles');
+  }
+  const listTitles = (lists || DEFAULT_LISTS).map(l => String(l).trim());
+  const sameTitle = b => String(b.title || '').trim().toLowerCase() === name.toLowerCase();
+  try {
+    // Read first so a re-run doesn't cost a state write + version bump.
+    const current = await getState(APP_NAME);
+    const found = current && (current.boards || []).find(sameTitle);
+    if (found) return res.json({ created: false, board: boardIndexEntry(found) });
+    const result = await mutateState(APP_NAME, (state) => {
+      state.boards = state.boards || [];
+      const existing = state.boards.find(sameTitle);
+      if (existing) return { created: false, board: existing };
+      const board = {
+        id: generateId(), title: name, background: 'ocean', starred: false, projectId: null,
+        members: [], createdAt: Date.now(),
+        lists: listTitles.map((t, i) => ({ id: generateId(), title: t, position: i, cards: [] })),
+      };
+      state.boards.unshift(board); // newest first, like the UI's createBoard
+      return { created: true, board };
+    });
+    res.status(result.created ? 201 : 200).json({ created: result.created, board: boardIndexEntry(result.board) });
+  } catch (err) { next(err); }
+});
+
+// POST /boards/:boardId/lists — add a column, e.g. a missing backlog or QC.
+// Idempotent by title (case-insensitive): an existing list is left where it is
+// (200). Otherwise it's inserted at `position` (0-based column index; default
+// last) and the board's positions are renumbered, like the UI's moveList (201).
+// body: { title, position? }
+router.post('/boards/:boardId/lists', async (req, res, next) => {
+  const { title, position } = req.body || {};
+  const name = String(title || '').trim();
+  if (!name) return badRequest(res, 'title is required');
+  if (position !== undefined && !(Number.isInteger(position) && position >= 0)) {
+    return badRequest(res, 'position must be a non-negative integer');
+  }
+  const sameTitle = l => String(l.title || '').trim().toLowerCase() === name.toLowerCase();
+  try {
+    const current = await getState(APP_NAME);
+    const board = current && findBoard(current, req.params.boardId);
+    if (!board) return res.status(404).json({ error: 'Board not found' });
+    if ((board.lists || []).some(sameTitle)) return res.json({ created: false, board: boardIndexEntry(board) });
+    const result = await mutateState(APP_NAME, (state) => {
+      const b = findBoard(state, req.params.boardId);
+      if (!b) throw Object.assign(new Error('Board not found'), { status: 404 });
+      b.lists = (b.lists || []).sort((x, y) => x.position - y.position);
+      if (b.lists.some(sameTitle)) return { created: false, board: b };
+      const at = position === undefined ? b.lists.length : Math.min(position, b.lists.length);
+      b.lists.splice(at, 0, { id: generateId(), title: name, position: at, cards: [] });
+      b.lists.forEach((l, i) => { l.position = i; });
+      return { created: true, board: b };
+    });
+    res.status(result.created ? 201 : 200).json({ created: result.created, board: boardIndexEntry(result.board) });
+  } catch (err) { next(err); }
+});
 
 // POST /cards — create a card at the bottom of a list.
 // body: { boardId, listId, title, description?, labels?, dueDate? }

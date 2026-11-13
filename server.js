@@ -7,6 +7,7 @@ const { initDb, getSession, startStateListener } = require('./db');
 const authRoutes = require('./routes/auth');
 const trellisRoutes = require('./routes/trellis');
 const trellisAgentRoutes = require('./routes/trellis-agent');
+const trellisAttachmentRoutes = require('./routes/trellis-attachments');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -41,7 +42,17 @@ app.use(async (req, res, next) => {
 });
 
 // API routes
+app.use('/api/trellis/attachments', trellisAttachmentRoutes);
 app.use('/api/trellis', trellisRoutes);
+
+// Owner shown on cards made in the browser (name + optional photo URL).
+app.get('/config.js', (req, res) => {
+  res.type('application/javascript').set('Cache-Control', 'no-cache');
+  res.send('window.TRELLIS_CONFIG = ' + JSON.stringify({
+    ownerName: process.env.OWNER_NAME || 'Me',
+    ownerAvatar: process.env.OWNER_AVATAR_URL || ''
+  }) + ';');
+});
 
 // Static files
 app.use(express.static(path.join(__dirname, 'public')));

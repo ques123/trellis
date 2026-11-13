@@ -114,7 +114,12 @@ function computePatch(prev, next) {
   if (JSON.stringify(prev.notifications || []) !== JSON.stringify(next.notifications || [])) {
     patch.notifications = next.notifications || [];
   }
-  if (!patch.boards.length && !patch.removedBoards.length && !patch.notifications) return null;
+  // Project folders + which are collapsed: tiny, so send them whole on change.
+  for (const key of ['projects', 'collapsedProjects']) {
+    if (JSON.stringify(prev[key] || []) !== JSON.stringify(next[key] || [])) patch[key] = next[key] || [];
+  }
+  if (!patch.boards.length && !patch.removedBoards.length && !patch.notifications
+      && !patch.projects && !patch.collapsedProjects) return null;
   return JSON.stringify(patch).length > PATCH_MAX_BYTES ? null : patch;
 }
 
@@ -223,3 +228,4 @@ router.put('/state', async (req, res) => {
 
 module.exports = router;
 module.exports.dedupeCards = dedupeCards; // exported for tests
+module.exports.computePatch = computePatch; // exported for tests

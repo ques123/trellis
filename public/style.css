@@ -134,6 +134,14 @@ img { max-width: 100%; display: block; }
   opacity: 0;
   pointer-events: none;
 }
+/* Sidebar backdrop — only ever visible on phones (see the max-width block). */
+.sidebar-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.3);
+  z-index: 140;
+}
 .sidebar-brand {
   display: flex;
   align-items: center;
@@ -310,6 +318,33 @@ img { max-width: 100%; display: block; }
 }
 @media (hover: none) {
   .sidebar-project-header .project-menu-btn { opacity: 1; }
+}
+
+/* Sidebar: Projects sits below Uncategorised */
+.sidebar-projects-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 12px;
+}
+
+/* Sidebar: drag a board onto a project folder, or back onto Uncategorised */
+.sidebar-drop-zone {
+  transition: background var(--transition), box-shadow var(--transition);
+}
+.sidebar-drop-zone.drop-over {
+  background: var(--accent-dim);
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+.sidebar-item.dragging { opacity: 0.4; }
+.sidebar-drop-empty {
+  margin: 2px 12px 6px;
+  padding: 8px 10px;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  color: var(--text-muted);
+  text-align: center;
 }
 
 /* Dashboard project sections */
@@ -842,11 +877,27 @@ img { max-width: 100%; display: block; }
   position: relative;
   user-select: none;
 }
-/* Auto-logged marker: a subtle 🤖 in the badge row (Claude shipped this via the
-   worktree→deploy convention). Sized to sit alongside the description/comment
-   icons (14px), no tint/border/label. */
+/* Creator marker leading the badge row: 🤖 for an agent's card, the owner's
+   photo or initials for theirs. Sized to sit alongside the description/comment icons (14px). */
 .card-badge.bot {
   font-size: 13px;
+}
+.card-badge.creator .creator-initials {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  color: #fff;
+  font-size: 8px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.card-badge.creator img {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  object-fit: cover;
 }
 .card:hover {
   border-color: var(--border-strong);
@@ -895,6 +946,9 @@ img { max-width: 100%; display: block; }
 .card-badge.overdue { color: var(--red); }
 .card-badge.due-soon { color: var(--yellow); }
 .card-badge.complete { color: var(--green); }
+/* Creation stamp: quieter than the working badges, which matter more at a glance. */
+.card-badge.created { opacity: 0.75; }
+.card-badge.created svg { width: 12px; height: 12px; }
 .card-members {
   display: flex;
   margin-left: auto;
@@ -1113,7 +1167,7 @@ img { max-width: 100%; display: block; }
   line-height: 1.3;
 }
 .modal-card-title:hover { background: var(--bg-hover); }
-.modal-card-title input {
+.modal-card-title textarea {
   font-family: var(--font-display);
   font-size: 20px;
   font-weight: 600;
@@ -1123,6 +1177,10 @@ img { max-width: 100%; display: block; }
   border: 1px solid var(--accent);
   border-radius: var(--radius-sm);
   color: var(--text-primary);
+  line-height: 1.3;
+  display: block;
+  resize: none;
+  overflow: hidden;
 }
 .modal-card-subtitle {
   font-size: 12px;
@@ -1337,6 +1395,105 @@ img { max-width: 100%; display: block; }
   text-align: left;
 }
 .rich-text th { background: var(--bg-hover); color: var(--text-primary); font-weight: 600; }
+/* ![alt](url) — dropped/pasted screenshots. Click opens the full file. */
+.rich-text a.rich-img { display: block; width: fit-content; max-width: 100%; margin: 4px 0 8px; }
+.rich-text a.rich-img img {
+  display: block;
+  max-width: 100%;
+  max-height: 320px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-subtle);
+}
+
+/* Attachments */
+.attachments { display: flex; flex-direction: column; gap: 6px; }
+.attachment {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px;
+  background: var(--bg-elevated);
+  border-radius: var(--radius-md);
+}
+.attachment-thumb {
+  width: 72px;
+  height: 52px;
+  flex-shrink: 0;
+  border-radius: var(--radius-sm);
+  background: var(--bg-hover);
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.attachment-thumb a { display: flex; width: 100%; height: 100%; align-items: center; justify-content: center; }
+.attachment-thumb img { width: 100%; height: 100%; object-fit: cover; }
+.attachment-ext {
+  font-family: var(--font-display);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+}
+.attachment-info { flex: 1; min-width: 0; }
+.attachment-name { font-size: 13px; font-weight: 500; }
+.attachment-name a { color: var(--text-primary); }
+.attachment-name a:hover { color: var(--accent-text); text-decoration: underline; }
+.attachment-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.attachment-meta a, .attachment-meta button {
+  color: var(--text-secondary);
+  text-decoration: underline;
+  font-size: 11px;
+}
+.attachment-meta a:hover, .attachment-meta button:hover { color: var(--text-primary); }
+.attachment-progress {
+  height: 4px;
+  margin-top: 8px;
+  border-radius: 2px;
+  background: var(--bg-hover);
+  overflow: hidden;
+}
+.attachment-progress div { height: 100%; background: var(--accent); transition: width 0.15s linear; }
+
+/* File drag-over targets: the open card, a card tile on the board, or a
+   comment/description editor (which gets a link inserted instead). */
+.modal-dialog.file-drop-over::after {
+  content: 'Drop files to attach';
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: calc(var(--drop-label-top, 50%) - 12px);
+  border: 2px dashed var(--accent);
+  border-radius: var(--radius-xl);
+  background: rgba(217,123,30,0.10);
+  color: var(--accent-text);
+  font-family: var(--font-display);
+  font-size: 16px;
+  font-weight: 600;
+  pointer-events: none;
+}
+.card.file-drop-over {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent);
+  background: var(--accent-dim);
+}
+.card.uploading { animation: attachPulse 1.2s ease-in-out infinite; }
+@keyframes attachPulse { 50% { box-shadow: 0 0 0 2px var(--accent-dim), 0 0 0 4px var(--accent-dim); } }
+textarea.file-drop-over {
+  outline: 2px dashed var(--accent);
+  outline-offset: 2px;
+  background: var(--accent-dim);
+}
 
 /* Checklists */
 .checklist {
@@ -1459,6 +1616,19 @@ img { max-width: 100%; display: block; }
   transition: color var(--transition);
 }
 .comment-actions button:hover { color: var(--text-primary); }
+.comment-edit textarea {
+  width: 100%;
+  padding: 8px 12px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  color: var(--text-primary);
+  font-size: 13px;
+  min-height: 60px;
+  line-height: 1.4;
+  resize: vertical;
+}
+.comment-edit textarea:focus { border-color: var(--accent); }
 .comment-input-wrapper {
   display: flex;
   gap: 10px;
@@ -1833,8 +2003,28 @@ img { max-width: 100%; display: block; }
     top: 0;
     z-index: 150;
     box-shadow: var(--shadow-xl);
+    transition: transform var(--transition-slow), box-shadow var(--transition-slow);
   }
-  .sidebar.collapsed { transform: translateX(-100%); }
+  /* Slide the panel out whole rather than squeezing it to nothing, so a
+     dragging finger can move it (shared/drawer-drag.js). */
+  .sidebar.collapsed {
+    transform: translateX(-100%);
+    width: var(--sidebar-width);
+    min-width: var(--sidebar-width);
+    opacity: 1;
+    box-shadow: none;
+  }
+  /* Dim + capture taps behind the open sidebar so tapping out closes it. */
+  .sidebar-overlay {
+    display: block;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity var(--transition-slow);
+  }
+  .sidebar:not(.collapsed) ~ .sidebar-overlay {
+    opacity: 1;
+    pointer-events: auto;
+  }
   .modal-layout { grid-template-columns: 1fr; }
   .modal-sidebar-actions {
     flex-direction: row;

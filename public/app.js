@@ -12,6 +12,7 @@ const ICONS = {
   star: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>',
   starFill: '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>',
   back: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>',
+  clock: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/></svg>',
   calendar: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>',
   tag: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20.59 13.41l-7.17 7.17a2 2 0 01-2.83 0L2 12V2h10l8.59 8.59a2 2 0 010 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>',
   check: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>',
@@ -67,7 +68,11 @@ const SAMPLE_USERS = [
   { id: 'u4', name: 'Elena Popov', email: 'elena@trellis.io', color: AVATAR_COLORS[3] },
   { id: 'u5', name: 'James Wilson', email: 'james@trellis.io', color: AVATAR_COLORS[4] }
 ];
-const CURRENT_USER = { id: 'u1', name: 'Adam', email: 'adam@trellis.io', color: AVATAR_COLORS[0] };
+// The board's owner (the one browser user). Name and optional photo come from
+// OWNER_NAME / OWNER_AVATAR_URL in the server's .env, via /config.js.
+const TRELLIS_CONFIG = window.TRELLIS_CONFIG || {};
+const CURRENT_USER = { id: 'u1', name: TRELLIS_CONFIG.ownerName || 'Me', email: '', color: AVATAR_COLORS[0] };
+const OWNER_AVATAR = TRELLIS_CONFIG.ownerAvatar || '';
 // Agent users — cards/comments/notifications from an agent (via the agent API)
 // are stamped with that agent's id and render its logo. id + token are paired
 // server-side in routes/trellis-agent.js (AGENTS).
@@ -165,33 +170,128 @@ let _saveTimer = null;  // debounce timer id while a save is pending (null = non
 let _saving = false;    // true while a PUT is in flight (incl. 409 retries)
 let _stateVersion = 0; // optimistic-concurrency version of the loaded state
 
+// ===== OFFLINE =====
+// The last-known state lives in IndexedDB (shared/offline.js), so the board
+// opens and stays editable with no network. `_shadow` is the JSON of the last
+// state known to be on the server; edits the server hasn't accepted yet are
+// flagged `_offlineDirty` and, once it's reachable again, three-way merged
+// (shared/trellis-merge.js) with whatever the server has by then.
+const OFFLINE_KEY = 'trellis';
+let _shadow = null;        // JSON string of the last server-confirmed state
+let _offline = false;      // last server contact failed
+let _offlineDirty = false; // local edits not yet accepted by the server
+let _noBaseline = false;   // opened offline with nothing cached: read-only until reload
+const hasOffline = () => typeof PBOffline !== 'undefined';
+
+function persistLocal(json, dirty) {
+  if (!hasOffline()) return;
+  PBOffline.set(OFFLINE_KEY, { state: json, shadow: dirty ? _shadow : json, version: _stateVersion, dirty: !!dirty, savedAt: Date.now() });
+}
+function setOffline(kind) {
+  _offline = true;
+  if (!hasOffline()) return;
+  if (kind === 'auth') PBOffline.status('error', 'Signed out: changes kept on this device, sign in to sync');
+  else if (_noBaseline) PBOffline.status('offline', 'Offline: no saved copy on this device yet');
+  else PBOffline.status('offline', _offlineDirty ? 'Offline: changes saved on this device' : 'Offline');
+}
+function setOnline() {
+  const was = _offline;
+  _offline = false;
+  if (was && hasOffline()) PBOffline.status('synced', 'Back online, synced');
+}
+
+function normalizeLoadedState() {
+  if (!state.activeFilters) state.activeFilters = { labels: [], members: [] };
+  if (!state.notifications) state.notifications = [];
+  if (!state.expandedLabels) state.expandedLabels = false;
+  state.users = [...SAMPLE_USERS, ...AGENT_USERS];
+  state.currentUser = CURRENT_USER;
+  if (!state.projects) state.projects = [];
+  if (!state.collapsedProjects) state.collapsedProjects = [];
+  state.boards.forEach(b => {
+    if (b.projectId === undefined) b.projectId = null;
+    b.members = (b.members || []).filter(id => id !== 'u1');
+    (b.lists || []).forEach(l => (l.cards || []).forEach(c => {
+      c.members = (c.members || []).filter(id => id !== 'u1');
+    }));
+  });
+}
+
 async function loadState() {
+  let snap = null;
+  try { snap = hasOffline() ? await PBOffline.get(OFFLINE_KEY) : null; } catch { snap = null; }
+  let server = null, failure = null;
   try {
     const res = await fetch('/api/trellis/state');
-    _stateVersion = Number(res.headers.get('X-State-Version')) || 0;
-    const data = await res.json();
-    if (data && data.boards) {
-      state = data;
-      if (!state.activeFilters) state.activeFilters = { labels: [], members: [] };
-      if (!state.notifications) state.notifications = [];
-      if (!state.expandedLabels) state.expandedLabels = false;
-      state.users = [...SAMPLE_USERS, ...AGENT_USERS];
-      state.currentUser = CURRENT_USER;
-      if (!state.projects) state.projects = [];
-      if (!state.collapsedProjects) state.collapsedProjects = [];
-      state.boards.forEach(b => {
-        if (b.projectId === undefined) b.projectId = null;
-        b.members = (b.members || []).filter(id => id !== 'u1');
-        (b.lists || []).forEach(l => (l.cards || []).forEach(c => {
-          c.members = (c.members || []).filter(id => id !== 'u1');
-        }));
-      });
-    } else {
-      state = createSampleData();
+    if (res.status === 401) failure = 'auth';
+    else if (!res.ok) failure = 'offline';
+    else {
+      _stateVersion = Number(res.headers.get('X-State-Version')) || 0;
+      server = await res.json();
     }
-  } catch {
-    state = createSampleData();
+  } catch { failure = 'offline'; }
+
+  if (failure) {
+    // No server: open the cached copy and keep working on it. Never fall back
+    // to sample data here: the first save would write it over the real board.
+    if (snap && snap.state) {
+      state = JSON.parse(snap.state);
+      _shadow = snap.shadow;
+      _stateVersion = snap.version || 0;
+      _offlineDirty = !!snap.dirty;
+      normalizeLoadedState();
+    } else {
+      state = { boards: [], projects: [], collapsedProjects: [], notifications: [], currentBoardId: null, view: 'dashboard', activeFilters: { labels: [], members: [] } };
+      normalizeLoadedState();
+      _noBaseline = true;
+    }
+    setOffline(failure);
+    return;
   }
+
+  if (server && server.boards) {
+    const serverJson = JSON.stringify(server);
+    if (snap && snap.dirty && snap.state && typeof mergeTrellis === 'function') {
+      // Edits left over from an offline session (or a tab closed mid-save):
+      // fold them into the current server state and save.
+      try {
+        state = mergeTrellis(snap.shadow ? JSON.parse(snap.shadow) : null, JSON.parse(snap.state), server);
+        _offlineDirty = true;
+      } catch (err) {
+        console.warn('offline merge failed, using server state', err);
+        state = server;
+      }
+    } else {
+      state = server;
+    }
+    _shadow = serverJson;
+    normalizeLoadedState();
+    if (_offlineDirty) setTimeout(() => pushState(), 0);
+    else persistLocal(JSON.stringify(state), false);
+  } else {
+    state = createSampleData();
+    // Fresh install (the server has never stored a board): save the starter
+    // boards so the agent API has something to work with straight away.
+    if (server === null) setTimeout(() => pushState(), 0);
+  }
+}
+
+// Reconnect: push pending edits, or just catch up when there are none.
+let _syncing = false;
+async function syncNow() {
+  if (_syncing || _saving || _saveTimer) return;
+  _syncing = true;
+  try {
+    if (_noBaseline) {
+      const r = await fetch('/api/trellis/version');
+      if (r.ok) location.reload();
+      return;
+    }
+    if (_offlineDirty) { await pushState(); return; }
+    const r = await fetch('/api/trellis/version');
+    if (r.ok) { setOnline(); await pollForUpdates(); }
+  } catch { /* still offline */ }
+  finally { _syncing = false; }
 }
 
 // Additively reconcile server-only items into local `state`. The agent API can
@@ -255,6 +355,9 @@ function reconcileFromServer(server) {
     const lb = state.boards.find(b => b.id === sb.id);
     if (!lb) { state.boards.push(clone(sb)); continue; }
     lb.title = sb.title;
+    // Which project folder the board is filed in. Without this, a tab that
+    // missed a move made elsewhere would save its stale folder back over it.
+    lb.projectId = sb.projectId || null;
     lb.lists = lb.lists || [];
     for (const sl of sb.lists || []) {
       const ll = lb.lists.find(l => l.id === sl.id);
@@ -264,7 +367,16 @@ function reconcileFromServer(server) {
       ll.cards = (sl.cards || []).map(clone); // reflects move/edit/delete/add + order
     }
   }
+  adoptProjects(server);
   mergeNotifications(server.notifications);
+}
+
+// The project folders and which of them are collapsed are shared state too, so
+// take the server's copy when it carries one (a write patch only includes them
+// when they changed).
+function adoptProjects(src) {
+  if (Array.isArray(src.projects)) state.projects = JSON.parse(JSON.stringify(src.projects));
+  if (Array.isArray(src.collapsedProjects)) state.collapsedProjects = src.collapsedProjects.slice();
 }
 
 // Additive union by id — never overwrites a local `read` flag, so "mark all read"
@@ -316,38 +428,75 @@ function applyPatch(patch) {
   }
 
   for (const id of patch.removedBoards || []) state.boards = state.boards.filter(b => b.id !== id);
+  adoptProjects(patch);
   if (patch.notifications) mergeNotifications(patch.notifications);
   return true;
 }
 
 async function pushState(attempt) {
   attempt = attempt || 0;
+  if (_noBaseline) return; // opened offline with no cached board: nothing safe to save
   if (attempt === 0) _saving = true; // suppress the poller until the save settles
+  const body = JSON.stringify(state);
+  persistLocal(body, true); // survives a closed tab or a dropped connection
+  const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timeout = ctrl ? setTimeout(() => ctrl.abort(), 20000) : null;
   try {
     const res = await fetch('/api/trellis/state', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json', 'X-State-Version': String(_stateVersion) },
-      body: JSON.stringify(state)
+      body,
+      signal: ctrl ? ctrl.signal : undefined
     });
     if (res.status === 409) {
-      // Someone wrote since we loaded (e.g. an agent card). Merge their additions
-      // on top of our pending edit, adopt their version, and retry the save.
-      const body = await res.json().catch(() => null);
-      if (body) { mergeServerAdditions(body.state); _stateVersion = Number(body.version) || _stateVersion; }
+      // Someone wrote since we loaded (e.g. an agent card). Merge their changes
+      // with our pending edit, adopt their version, and retry the save. After an
+      // offline stretch that can be a lot, so use the full three-way merge;
+      // online, the window is one debounce, so additions are all that matter.
+      const resBody = await res.json().catch(() => null);
+      if (resBody && resBody.state) {
+        if (_offlineDirty && _shadow && typeof mergeTrellis === 'function') {
+          state = mergeTrellis(JSON.parse(_shadow), state, resBody.state);
+          normalizeLoadedState();
+        } else {
+          mergeServerAdditions(resBody.state);
+        }
+        _shadow = JSON.stringify(resBody.state);
+        _stateVersion = Number(resBody.version) || _stateVersion;
+      }
       if (attempt < 3) { await pushState(attempt + 1); return; }
       console.warn('save: gave up after repeated version conflicts');
       return;
     }
-    if (!res.ok) { console.warn('Failed to save state:', res.status); return; }
+    if (res.status === 401) { _offlineDirty = true; setOffline('auth'); return; }
+    if (!res.ok) {
+      if (hasOffline() && PBOffline.isOfflineResponse(res)) { _offlineDirty = true; setOffline('offline'); return; }
+      console.warn('Failed to save state:', res.status);
+      return;
+    }
     const v = res.headers.get('X-State-Version');
     if (v != null) _stateVersion = Number(v);
-    // If a conflict merge pulled in new cards, show them (but never re-render
-    // mid-drag — that would break an in-progress drag).
+    _shadow = body;
+    // Only mark clean if nothing changed while the PUT was in flight.
+    const changedMeanwhile = _saveTimer || JSON.stringify(state) !== body;
+    if (!changedMeanwhile) { _offlineDirty = false; persistLocal(body, false); }
+    setOnline();
+    // If a conflict merge pulled in changes, show them (but never re-render
+    // mid-drag: that would break an in-progress drag).
     if (attempt > 0 && typeof renderBoard === 'function'
-        && !(typeof dragActive === 'function' && dragActive())) renderBoard();
+        && !(typeof dragActive === 'function' && dragActive())) {
+      render();
+      if (currentModalCard) {
+        if (getCard(currentModalCard.boardId, currentModalCard.cardId)) renderCardModal();
+        else closeModal();
+      }
+    }
   } catch (err) {
-    console.warn('Failed to save state:', err);
+    // Network down (or timed out): the edit is already in IndexedDB.
+    _offlineDirty = true;
+    setOffline('offline');
   } finally {
+    if (timeout) clearTimeout(timeout);
     if (attempt === 0) _saving = false; // runs after all retries settle
   }
 }
@@ -357,7 +506,7 @@ function saveState() {
   // Null the id when the debounce fires so `_saveTimer` means "save pending" and
   // doesn't stay truthy forever — otherwise the poller's guard would disable
   // live updates after the user's first edit.
-  _saveTimer = setTimeout(() => { _saveTimer = null; pushState(); }, 500);
+  _saveTimer = setTimeout(() => { _saveTimer = null; pushState(); }, _offline ? 1500 : 500);
 }
 
 // ===== LIVE UPDATES =====
@@ -377,7 +526,7 @@ let _applying = false;
 // keep the announced version and apply it the moment the user is idle, so an
 // update is delayed, never dropped.
 function liveUpdatesBusy() {
-  if (document.hidden || _saveTimer || _saving) return true;
+  if (document.hidden || _saveTimer || _saving || _offlineDirty || _noBaseline) return true;
   if (typeof dragActive === 'function' && dragActive()) return true;
   // The global search box is exempt: it lives in the sidebar, outside
   // #view-container, so a board re-render never touches it. Parking focus there
@@ -400,6 +549,9 @@ async function applyServerState(announced) {
     if (newVer <= _stateVersion) return; // already current
     reconcileFromServer(server);
     _stateVersion = newVer;
+    _shadow = JSON.stringify(server);
+    persistLocal(JSON.stringify(state), false);
+    setOnline();
     if (_pendingVersion <= newVer) _pendingVersion = 0;
     render();
     // The open card may have moved, changed, or been deleted out from under us.
@@ -446,6 +598,8 @@ function connectLiveUpdates() {
     if (msg.patch && msg.base === _stateVersion && !liveUpdatesBusy() && !_applying) {
       if (applyPatch(msg.patch)) {
         _stateVersion = version;
+        _shadow = JSON.stringify(state);
+        persistLocal(_shadow, false);
         render();
         if (currentModalCard) {
           if (getCard(currentModalCard.boardId, currentModalCard.cardId)) renderCardModal();
@@ -519,6 +673,31 @@ function formatDateFull(ts) {
   const d = new Date(ts);
   return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
 }
+// Creation stamps on cards and comments: "Oct 28, 14:05", with the year only
+// when it isn't this year. formatDateTimeFull is the hover/modal version.
+function formatDateTime(ts) {
+  const d = new Date(ts);
+  const time = d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+  const year = d.getFullYear() === new Date().getFullYear() ? '' : ` ${d.getFullYear()}`;
+  return `${formatDate(ts)}${year}, ${time}`;
+}
+function formatDateTimeFull(ts) {
+  const d = new Date(ts);
+  return `${formatDateFull(ts)}, ${d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}`;
+}
+// Who made a card. Agent cards have always stored createdBy; UI cards only do
+// since Oct 2026, and the UI is single-user, so a missing createdBy is the owner.
+function cardCreator(card) {
+  return (card.createdBy && getUser(card.createdBy)) || CURRENT_USER;
+}
+// Card-tile age in calendar days: Today, 1 Day … 7 Day, then the date (Oct 24).
+function cardAge(ts) {
+  const midnight = t => new Date(t).setHours(0, 0, 0, 0);
+  const days = Math.round((midnight(Date.now()) - midnight(ts)) / 86400000);
+  if (days <= 0) return 'Today';
+  if (days <= 7) return `${days} Day`;
+  return formatDate(ts);
+}
 function timeAgo(ts) {
   const diff = Date.now() - ts;
   const mins = Math.floor(diff / 60000);
@@ -556,11 +735,22 @@ function escapeHtml(str) {
 // markup can survive — never feed it anything but user text.
 const RICH_SAFE_URL = /^(https?:\/\/|mailto:|\/)/i;
 const RICH_LINK_ATTRS = 'target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()"';
+// Images load without a click, so only https or our own paths (uploaded
+// attachments) — never `//host` or plain http.
+const RICH_IMG_URL = /^(https:\/\/|\/(?!\/))/i;
 
 // Inline spans, applied to already-escaped text one block at a time.
 function renderRichInline(escaped) {
   const codes = [];
   let s = escaped.replace(/`([^`\n]+)`/g, (m, code) => `\u0000C${codes.push(code) - 1}\u0000`);
+
+  // ![alt](url) — dropped/pasted screenshots in comments. Stashed like code
+  // spans so the emphasis rules below can't reach into the src/alt.
+  const imgs = [];
+  s = s.replace(/!\[([^\]\n]*)\]\(([^)\s]+)\)/g, (m, alt, url) =>
+    RICH_IMG_URL.test(url.replace(/&amp;/g, '&'))
+      ? `\u0000I${imgs.push(`<a class="rich-img" href="${url}" ${RICH_LINK_ATTRS}><img src="${url}" alt="${alt}" loading="lazy"></a>`) - 1}\u0000`
+      : m);
 
   s = s.replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/g, (m, text, url) =>
     RICH_SAFE_URL.test(url.replace(/&amp;/g, '&'))
@@ -579,7 +769,8 @@ function renderRichInline(escaped) {
   s = s.replace(/(^|[^_\w])_(?![\s_])([^_\n]*[^\s_])_(?![\w_])/g, '$1<em>$2</em>');
   s = s.replace(/~~([^~\n]+)~~/g, '<del>$1</del>');
 
-  return s.replace(/\u0000C(\d+)\u0000/g, (m, i) => `<code>${codes[i]}</code>`);
+  return s.replace(/\u0000C(\d+)\u0000/g, (m, i) => `<code>${codes[i]}</code>`)
+    .replace(/\u0000I(\d+)\u0000/g, (m, i) => imgs[i]);
 }
 
 function renderRichText(str) {
@@ -739,7 +930,7 @@ function createCard(boardId, listId, title) {
     position: list.cards.length,
     labels: [], dueDate: null, dueDone: false,
     members: [], checklists: [], comments: [],
-    attachments: [], createdAt: Date.now()
+    attachments: [], createdAt: Date.now(), createdBy: state.currentUser.id
   };
   list.cards.push(card);
   saveState();
@@ -846,6 +1037,16 @@ function deleteComment(boardId, cardId, commentId) {
   const result = getCard(boardId, cardId);
   if (!result) return;
   result.card.comments = result.card.comments.filter(c => c.id !== commentId);
+  saveState();
+}
+
+function updateComment(boardId, cardId, commentId, text) {
+  const result = getCard(boardId, cardId);
+  if (!result) return;
+  const comment = (result.card.comments || []).find(c => c.id === commentId);
+  if (!comment || comment.text === text) return;
+  comment.text = text;
+  comment.editedAt = Date.now();
   saveState();
 }
 
@@ -1000,16 +1201,36 @@ function renderSidebar() {
     starred.forEach(b => { html += sidebarBoardItem(b); });
   }
 
+  // Uncategorised first, project folders below it: the folders are where
+  // finished or parked boards get filed away (collapsed), so they sit out of
+  // the way. Every section with data-drop-project is a drop target for a board
+  // dragged from anywhere in the sidebar ('' = take it out of its project).
+  const uncategorised = state.boards.filter(b => !sidebarProjectOf(b));
+  const hasProjects = state.projects.length > 0;
+  const sectionGap = starred.length ? 'margin-top:12px' : '';
+  html += `<div class="sidebar-drop-zone" data-drop-project="">`;
+  if (uncategorised.length || hasProjects) {
+    html += `<div class="sidebar-section-title" style="${sectionGap}">Uncategorised</div>`;
+  }
+  uncategorised.forEach(b => { html += sidebarBoardItem(b); });
+  if (!uncategorised.length && hasProjects) {
+    html += `<div class="sidebar-drop-empty">Drag boards here from a project</div>`;
+  }
+  html += `<div class="sidebar-add-board" onclick="promptCreateBoard()">${ICONS.plus} <span>Create new board</span></div>`;
+  html += `</div>`;
+
   // Projects header with + button
-  html += `<div class="sidebar-section-title" style="margin-top:${starred.length ? '12px' : '0'};display:flex;align-items:center;justify-content:space-between">
+  html += `<div class="sidebar-section-title sidebar-projects-title">
     <span>Projects</span>
     <button class="sidebar-section-action" onclick="event.stopPropagation();promptCreateProject()" title="Create project">${ICONS.plus}</button>
   </div>`;
 
-  // Per-project sections
+  // One folder per project; collapsed ones show just their header, and still
+  // take drops, so a board can be filed straight into a folder that stays shut.
   state.projects.forEach(project => {
     const projectBoards = state.boards.filter(b => b.projectId === project.id);
     const isCollapsed = state.collapsedProjects.includes(project.id);
+    html += `<div class="sidebar-drop-zone" data-drop-project="${project.id}">`;
     html += `<div class="sidebar-project-header ${isCollapsed ? 'collapsed' : ''}" onclick="toggleProjectCollapsed('${project.id}')">
       <span class="project-color-dot" style="background:${project.color}"></span>
       <span class="chevron-icon">${ICONS.chevron}</span>
@@ -1020,16 +1241,9 @@ function renderSidebar() {
     if (!isCollapsed) {
       projectBoards.forEach(b => { html += sidebarBoardItem(b); });
     }
+    html += `</div>`;
   });
 
-  // Uncategorised section
-  const uncategorised = state.boards.filter(b => !b.projectId);
-  if (uncategorised.length) {
-    html += `<div class="sidebar-section-title" style="margin-top:8px">Uncategorised</div>`;
-    uncategorised.forEach(b => { html += sidebarBoardItem(b); });
-  }
-
-  html += `<div class="sidebar-add-board" onclick="promptCreateBoard()">${ICONS.plus} <span>Create new board</span></div>`;
   nav.innerHTML = html;
 
   footer.innerHTML = '';
@@ -1062,10 +1276,20 @@ function promptRenameProject(projectId) {
   render();
 }
 
+// The project a board is filed in, or null. A board pointing at a project that
+// no longer exists counts as uncategorised, so it can't vanish from the sidebar.
+function sidebarProjectOf(board) {
+  return board.projectId ? state.projects.find(p => p.id === board.projectId) || null : null;
+}
+
 function sidebarBoardItem(board) {
   const active = state.currentBoardId === board.id && state.view === 'board' ? 'active' : '';
   const bg = getBgGradient(board.background);
-  return `<div class="sidebar-item ${active}" data-board-id="${board.id}" onclick="openBoard('${board.id}')">
+  // Draggable onto a project folder (see SIDEBAR BOARD DRAG) once one exists.
+  const drag = state.projects.length
+    ? ` draggable="true" ondragstart="onSidebarBoardDragStart(event,'${board.id}')" ondragend="onSidebarBoardDragEnd()"`
+    : '';
+  return `<div class="sidebar-item ${active}" data-board-id="${board.id}"${drag} onclick="openBoard('${board.id}')">
     <span class="board-dot" style="background:${bg}"></span>
     <span class="truncate">${escapeHtml(board.title)}</span>
     <button class="star-btn ${board.starred ? 'starred' : ''}" onclick="event.stopPropagation();toggleBoardStar('${board.id}');render()">
@@ -1204,7 +1428,16 @@ function renderBoard() {
   // reordering/editing a card doesn't jump the view back to the far left.
   // Switching to a different board (or reopening one) starts at the left.
   const prevWrapper = document.getElementById('lists-wrapper');
-  const keepScroll = (prevWrapper && lastRenderedBoardId === board.id) ? prevWrapper.scrollLeft : 0;
+  const sameBoard = prevWrapper && lastRenderedBoardId === board.id;
+  const keepScroll = sameBoard ? prevWrapper.scrollLeft : 0;
+  // Each list scrolls vertically on its own; keep those too, or closing a card
+  // opened far down a long list snaps that list back to the top.
+  const keepListScroll = {};
+  if (sameBoard) {
+    prevWrapper.querySelectorAll('.list-cards').forEach(el => {
+      if (el.scrollTop) keepListScroll[el.dataset.listId] = el.scrollTop;
+    });
+  }
 
   let filtersHtml = '';
   if (state.activeFilters.labels.length || state.activeFilters.members.length) {
@@ -1246,6 +1479,10 @@ function renderBoard() {
       w.scrollLeft = keepScroll;
       w.style.scrollBehavior = '';
     }
+  }
+  for (const [listId, top] of Object.entries(keepListScroll)) {
+    const el = document.getElementById(`cards-${listId}`);
+    if (el) el.scrollTop = top;
   }
   lastRenderedBoardId = board.id;
 }
@@ -1295,12 +1532,18 @@ function renderCardHtml(boardId, card) {
     if (total) badges.push(`<span class="card-badge ${done === total ? 'complete' : ''}">${ICONS.checkSquare} ${done}/${total}</span>`);
   });
 
-  // Auto-logged = a card Claude created automatically when it shipped a worktree
-  // feature (vs. one you made, or one Claude merely filed). Marked subtly: a 🤖 in
-  // the badge row, same size/place as the description + comment icons. Nothing
-  // else — no tint, border, or label.
-  if (card.origin === 'autolog') {
-    badges.unshift('<span class="card-badge bot" title="Auto-logged by Claude — built via the worktree → deploy convention">🤖</span>');
+  // Who made the card leads the badge row: the owner's photo (or initials) for
+  // their own cards, a 🤖
+  // for an agent's (Claude or Codex).
+  const creator = cardCreator(card);
+  const createdTitle = `Created by ${escapeHtml(creator.name)}${card.createdAt ? ', ' + formatDateTimeFull(card.createdAt) : ''}`;
+  badges.unshift(creator.id === CURRENT_USER.id
+    ? `<span class="card-badge creator" title="${createdTitle}">${OWNER_AVATAR
+        ? `<img src="${escapeHtml(OWNER_AVATAR)}" alt="">`
+        : `<span class="creator-initials" style="background:${CURRENT_USER.color}">${getInitials(CURRENT_USER.name)}</span>`}</span>`
+    : `<span class="card-badge bot" title="${createdTitle}">🤖</span>`);
+  if (card.createdAt) {
+    badges.push(`<span class="card-badge created" title="${createdTitle}">${ICONS.clock} ${cardAge(card.createdAt)}</span>`);
   }
 
   const membersHtml = card.members.slice(0, 3).map(uid => {
@@ -1333,6 +1576,8 @@ function filterCardsForDisplay(cards) {
 
 // ===== CARD MODAL =====
 let currentModalCard = null;
+let editingCommentId = null;
+let commentDraft = { cardId: null, text: '' }; // unsent comment, kept across re-renders
 
 // Find a card by id across all boards. Deep links carry only the card id (the
 // agent API resolves a card the same way server-side), so the boardId is looked
@@ -1360,6 +1605,7 @@ function openCardModal(boardId, cardId) {
   const result = getCard(boardId, cardId);
   if (!result) return;
   currentModalCard = { boardId, cardId };
+  editingCommentId = null;
   renderCardModal();
   document.getElementById('modal-overlay').classList.remove('hidden');
   document.body.style.overflow = 'hidden';
@@ -1369,6 +1615,7 @@ function closeModal() {
   document.getElementById('modal-overlay').classList.add('hidden');
   document.body.style.overflow = '';
   currentModalCard = null;
+  editingCommentId = null;
   closeDropdown();
   if (state.view === 'board') renderBoard();
 }
@@ -1436,49 +1683,51 @@ function renderCardModal() {
   });
 
   let commentsHtml = '';
+  // The draft survives re-renders (an upload landing, a live update), which
+  // rebuild this whole modal — before, any re-render wiped a half-typed comment.
+  const draft = commentDraft.cardId === cardId ? commentDraft.text : '';
   commentsHtml += `<div class="comment-input-wrapper">
     ${avatarHtml(state.currentUser)}
-    <textarea id="comment-input" placeholder="Write a comment..." rows="1"></textarea>
+    <textarea id="comment-input" placeholder="Write a comment... (drop or paste images and files here)" rows="${draft ? 3 : 1}" oninput="commentDraft={cardId:'${cardId}',text:this.value}">${escapeHtml(draft)}</textarea>
     <button class="btn btn-primary btn-sm" onclick="submitComment('${boardId}','${cardId}')">Save</button>
   </div>`;
   // Newest first. The browser prepends new comments but the agent API appends
   // them, so sort rather than trust array order.
   [...card.comments].sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0)).forEach(c => {
     const user = getUser(c.userId) || state.currentUser;
-    const isOwn = c.userId === state.currentUser.id;
+    const meta = `<div class="comment-meta">
+          <span class="comment-author">${escapeHtml(user.name)}</span>
+          <span class="comment-time" title="${c.timestamp ? formatDateTimeFull(c.timestamp) : ''}">${c.timestamp ? `${formatDateTime(c.timestamp)} &middot; ${timeAgo(c.timestamp)}` : ''}</span>
+          ${c.editedAt ? `<span class="comment-time" title="Edited ${formatDateTimeFull(c.editedAt)}">(edited)</span>` : ''}
+        </div>`;
+    // Anyone can edit or delete any comment — agents leave comments here too,
+    // and their author "user" never comes back to clean up after itself.
+    const body = c.id === editingCommentId
+      ? `<div class="comment-edit">
+          <textarea id="comment-edit" onkeydown="if(event.key==='Escape')cancelEditComment()">${escapeHtml(c.text)}</textarea>
+          <div style="display:flex;gap:6px;margin-top:6px">
+            <button class="btn btn-primary btn-sm" onclick="saveEditedComment('${boardId}','${cardId}','${c.id}')">Save</button>
+            <button class="btn btn-ghost btn-sm" onclick="cancelEditComment()">Cancel</button>
+          </div>
+        </div>`
+      : `<div class="comment-text rich-text">${renderRichText(c.text)}</div>
+        <div class="comment-actions">
+          <button onclick="startEditComment('${boardId}','${cardId}','${c.id}')">Edit</button>
+          <button onclick="deleteComment('${boardId}','${cardId}','${c.id}');renderCardModal()">Delete</button>
+        </div>`;
     commentsHtml += `<div class="comment" style="margin-top:14px">
       ${avatarHtml(user)}
       <div class="comment-body">
-        <div class="comment-meta">
-          <span class="comment-author">${escapeHtml(user.name)}</span>
-          <span class="comment-time">${timeAgo(c.timestamp)}</span>
-        </div>
-        <div class="comment-text rich-text">${renderRichText(c.text)}</div>
-        ${isOwn ? `<div class="comment-actions"><button onclick="deleteComment('${boardId}','${cardId}','${c.id}');renderCardModal()">Delete</button></div>` : ''}
+        ${meta}
+        ${body}
       </div>
     </div>`;
   });
 
-  let attachmentsHtml = '';
-  if (card.attachments.length) {
-    attachmentsHtml = `<div class="modal-section">
-      <div class="modal-section-title">${ICONS.attach} Attachments</div>`;
-    card.attachments.forEach(a => {
-      attachmentsHtml += `<div style="display:flex;align-items:center;gap:10px;padding:8px;background:var(--bg-elevated);border-radius:var(--radius-md);margin-bottom:6px">
-        <div style="width:40px;height:40px;background:var(--bg-hover);border-radius:var(--radius-sm);display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:600;color:var(--text-muted);text-transform:uppercase">${a.type}</div>
-        <div style="flex:1;min-width:0">
-          <div style="font-size:13px;font-weight:500" class="truncate">${escapeHtml(a.name)}</div>
-          <div style="font-size:11px;color:var(--text-muted)">${a.size} &middot; ${timeAgo(a.timestamp)}</div>
-        </div>
-      </div>`;
-    });
-    attachmentsHtml += '</div>';
-  }
-
   body.innerHTML = `
     <div class="modal-card-header">
       <div class="modal-card-title" id="modal-card-title" onclick="startEditCardTitle(this,'${boardId}','${cardId}')">${escapeHtml(card.title)}</div>
-      <div class="modal-card-subtitle">in list <strong>${escapeHtml(list.title)}</strong></div>
+      <div class="modal-card-subtitle">in list <strong>${escapeHtml(list.title)}</strong>${card.createdAt ? ` &middot; created ${formatDateTimeFull(card.createdAt)}` : ''} by <strong>${escapeHtml(cardCreator(card).name)}</strong></div>
     </div>
     <div class="modal-layout">
       <div class="modal-main">
@@ -1490,7 +1739,7 @@ function renderCardModal() {
           <div class="modal-description">${descDisplay}</div>
         </div>
         ${checklistsHtml ? `<div class="modal-section"><div class="modal-section-title">${ICONS.checkSquare} Checklists</div>${checklistsHtml}</div>` : ''}
-        ${attachmentsHtml}
+        <div id="modal-attachments">${attachmentsSectionHtml(boardId, cardId, card)}</div>
         <div class="modal-section">
           <div class="modal-section-title">${ICONS.comment} Comments</div>
           ${commentsHtml}
@@ -1502,7 +1751,7 @@ function renderCardModal() {
         <button class="modal-action-btn" onclick="showMemberPicker(this,'${boardId}','${cardId}')">${ICONS.user} Members</button>
         <button class="modal-action-btn" onclick="showDatePicker(this,'${boardId}','${cardId}')">${ICONS.calendar} Due Date</button>
         <button class="modal-action-btn" onclick="promptAddChecklist('${boardId}','${cardId}')">${ICONS.checkSquare} Checklist</button>
-        <button class="modal-action-btn" onclick="addSimulatedAttachment('${boardId}','${cardId}')">${ICONS.attach} Attachment</button>
+        <button class="modal-action-btn" onclick="pickAttachments('${boardId}','${cardId}')" title="Or drop / paste files anywhere on the card">${ICONS.attach} Attachment</button>
         <div class="section-label">Actions</div>
         <button class="modal-action-btn" onclick="showMoveCardPicker(this,'${boardId}','${cardId}')">${ICONS.move} Move</button>
         <button class="modal-action-btn" onclick="copyCard('${boardId}','${cardId}')">${ICONS.copy} Copy</button>
@@ -1516,25 +1765,50 @@ function submitComment(boardId, cardId) {
   const input = document.getElementById('comment-input');
   if (!input || !input.value.trim()) return;
   addComment(boardId, cardId, input.value.trim());
+  commentDraft = { cardId: null, text: '' };
+  renderCardModal();
+}
+
+function startEditComment(boardId, cardId, commentId) {
+  editingCommentId = commentId;
+  renderCardModal();
+  const ta = document.getElementById('comment-edit');
+  if (ta) { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); }
+}
+
+function cancelEditComment() {
+  editingCommentId = null;
+  renderCardModal();
+}
+
+function saveEditedComment(boardId, cardId, commentId) {
+  const ta = document.getElementById('comment-edit');
+  const text = ta ? ta.value.trim() : '';
+  editingCommentId = null;
+  if (text) updateComment(boardId, cardId, commentId, text);
   renderCardModal();
 }
 
 function startEditCardTitle(el, boardId, cardId) {
-  // Already editing: the click that landed here bubbled up from the input itself
-  // (the wrapping div keeps its onclick). Rebuilding now would blur+destroy the
-  // focused input and revert to display mode — so clicking to place the cursor
-  // would kick you out of editing. Bail and let the existing input keep focus.
-  if (el.querySelector('input')) return;
+  // Already editing: the click that landed here bubbled up from the textarea
+  // itself (the wrapping div keeps its onclick). Rebuilding now would
+  // blur+destroy the focused editor and revert to display mode — so clicking to
+  // place the cursor would kick you out of editing. Bail and keep its focus.
+  if (el.querySelector('textarea')) return;
   const result = getCard(boardId, cardId);
   if (!result) return;
-  el.innerHTML = `<input type="text" value="${escapeHtml(result.card.title)}" onblur="finishEditCardTitle(this,'${boardId}','${cardId}')" onkeydown="if(event.key==='Enter')this.blur();if(event.key==='Escape'){this.dataset.cancel='1';this.blur()}" autofocus>`;
-  el.querySelector('input').focus();
-  el.querySelector('input').select();
+  // A textarea, not an input: long titles wrap like the display does instead of
+  // becoming one horizontally-scrolling line. Enter still commits.
+  el.innerHTML = `<textarea rows="1" onblur="finishEditCardTitle(this,'${boardId}','${cardId}')" oninput="this.style.height='auto';this.style.height=this.scrollHeight+'px'" onkeydown="if(event.key==='Enter'){event.preventDefault();this.blur()}else if(event.key==='Escape'){this.dataset.cancel='1';this.blur()}">${escapeHtml(result.card.title)}</textarea>`;
+  const ta = el.querySelector('textarea');
+  ta.style.height = ta.scrollHeight + 'px';
+  ta.focus();
+  ta.select();
 }
 
 function finishEditCardTitle(input, boardId, cardId) {
   if (input.dataset.cancel) return renderCardModal();
-  const val = input.value.trim();
+  const val = input.value.replace(/\n/g, ' ').trim();
   if (val) updateCard(boardId, cardId, { title: val });
   renderCardModal();
 }
@@ -1568,20 +1842,349 @@ function promptAddChecklist(boardId, cardId) {
   }
 }
 
-function addSimulatedAttachment(boardId, cardId) {
-  const names = ['document.pdf', 'screenshot.png', 'notes.txt', 'design-mockup.fig', 'specs.docx', 'data.csv'];
-  const sizes = ['1.2 MB', '3.5 MB', '256 KB', '8.4 MB', '512 KB', '2.1 MB'];
-  const i = Math.floor(Math.random() * names.length);
+// ===== ATTACHMENTS =====
+// Files upload to /api/trellis/attachments (stored on disk server-side); the card
+// keeps only a small reference to each, never the bytes — the trellis blob ships
+// to every open board on every write. Files get in three ways: the Attachment
+// button, dropping onto the open card (or a card tile on the board), and pasting.
+// Dropping/pasting into a comment or description editor instead inserts a
+// markdown link (an inline image for pictures) at the cursor.
+const ATTACH_MAX_BYTES = 15 * 1024 * 1024; // = nginx client_max_body_size (see README)
+const INLINE_IMAGE_TYPES = /^image\/(png|jpe?g|gif|webp|avif|bmp|svg\+xml)$/;
+const pendingUploads = []; // { key, cardId, name, loaded, total }
+
+function formatBytes(n) {
+  if (typeof n !== 'number') return n || ''; // legacy attachments stored a string
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return Math.round(n / 1024) + ' KB';
+  return (n / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+function fileExt(name) {
+  const m = /\.([a-z0-9]{1,6})$/i.exec(name || '');
+  return m ? m[1].toLowerCase() : 'file';
+}
+
+// Clipboard screenshots all arrive as "image.png"; give them a findable name.
+function namePastedFile(file) {
+  if (!/^image\.\w+$/i.test(file.name || '')) return file;
+  const d = new Date();
+  const p = n => String(n).padStart(2, '0');
+  const stamp = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}.${p(d.getMinutes())}.${p(d.getSeconds())}`;
+  return new File([file], `Screenshot ${stamp}.${fileExt(file.name)}`, { type: file.type });
+}
+
+// POST the raw bytes. Always application/octet-stream so the server's global
+// JSON parser never swallows a .json upload; the real type rides in a header.
+function uploadFile(file, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/api/trellis/attachments');
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    xhr.setRequestHeader('X-Filename', encodeURIComponent(file.name || 'file'));
+    xhr.setRequestHeader('X-File-Type', file.type || 'application/octet-stream');
+    xhr.upload.onprogress = e => { if (e.lengthComputable && onProgress) onProgress(e.loaded, e.total); };
+    xhr.onload = () => {
+      let body = null;
+      try { body = JSON.parse(xhr.responseText); } catch { /* nginx error pages are HTML */ }
+      if (xhr.status === 201 && body && body.url) return resolve(body);
+      if (xhr.status === 413) return reject(new Error('too large (max 15 MB)'));
+      reject(new Error((body && body.error) || `upload failed (${xhr.status})`));
+    };
+    xhr.onerror = () => reject(new Error('network error'));
+    xhr.send(file);
+  });
+}
+
+function attachmentFromUpload(meta) {
+  return {
+    id: meta.id, name: meta.name, url: meta.url, mime: meta.mime, size: meta.size,
+    type: fileExt(meta.name), userId: state.currentUser.id, timestamp: Date.now()
+  };
+}
+
+function isInlineImage(a) { return !!(a && a.url && INLINE_IMAGE_TYPES.test(a.mime || '')); }
+
+function rejectOversized(files) {
+  const ok = [];
+  for (const f of files) {
+    if (f.size > ATTACH_MAX_BYTES) showToast(`${f.name} is too large (max 15 MB)`, 'error');
+    else if (!f.size) showToast(`${f.name} is empty`, 'error');
+    else ok.push(f);
+  }
+  return ok;
+}
+
+function attachmentsSectionHtml(boardId, cardId, card) {
+  const pending = pendingUploads.filter(u => u.cardId === cardId);
+  const atts = [...(card.attachments || [])].sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+  if (!atts.length && !pending.length) return '';
+
+  const rows = pending.map(u => `
+    <div class="attachment uploading">
+      <div class="attachment-thumb"><span class="attachment-ext">${escapeHtml(fileExt(u.name))}</span></div>
+      <div class="attachment-info">
+        <div class="attachment-name truncate">${escapeHtml(u.name)}</div>
+        <div class="attachment-progress"><div id="upload-bar-${u.key}" style="width:${u.total ? Math.round(100 * u.loaded / u.total) : 0}%"></div></div>
+      </div>
+    </div>`).join('') + atts.map(a => {
+    const url = a.url ? escapeHtml(a.url) : '';
+    const thumb = isInlineImage(a)
+      ? `<img src="${url}" alt="" loading="lazy">`
+      : `<span class="attachment-ext">${escapeHtml(a.type || fileExt(a.name))}</span>`;
+    const open = inner => url ? `<a href="${url}" target="_blank" rel="noopener">${inner}</a>` : inner;
+    return `
+    <div class="attachment">
+      <div class="attachment-thumb">${open(thumb)}</div>
+      <div class="attachment-info">
+        <div class="attachment-name truncate">${open(escapeHtml(a.name))}</div>
+        <div class="attachment-meta">
+          <span>${escapeHtml(formatBytes(a.size))}${a.timestamp ? ' &middot; ' + timeAgo(a.timestamp) : ''}</span>
+          ${url ? `<a href="${url}" download="${escapeHtml(a.name)}">Download</a>` : ''}
+          <button onclick="removeAttachment('${boardId}','${cardId}','${a.id}')">Delete</button>
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+
+  return `<div class="modal-section">
+    <div class="modal-section-title">${ICONS.attach} Attachments
+      <button class="btn btn-ghost btn-sm" style="margin-left:auto" onclick="pickAttachments('${boardId}','${cardId}')">Add</button>
+    </div>
+    <div class="attachments">${rows}</div>
+  </div>`;
+}
+
+// Redraw just the attachments block, so an upload finishing never rebuilds the
+// modal under a comment or description that's being typed.
+function refreshModalAttachments(cardId) {
+  if (!currentModalCard || currentModalCard.cardId !== cardId) return;
+  const el = document.getElementById('modal-attachments');
+  const result = getCard(currentModalCard.boardId, cardId);
+  if (el && result) el.innerHTML = attachmentsSectionHtml(currentModalCard.boardId, cardId, result.card);
+}
+
+function pickAttachments(boardId, cardId) {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.multiple = true;
+  input.onchange = () => attachFiles(boardId, cardId, [...input.files]);
+  input.click();
+}
+
+// Upload files and add them to the card's attachment list.
+function attachFiles(boardId, cardId, files) {
+  files = rejectOversized(files);
+  if (!files.length) return;
+  for (const file of files) {
+    const job = { key: generateId(), cardId, name: file.name, loaded: 0, total: file.size };
+    pendingUploads.push(job);
+    const tile = document.querySelector(`.card[data-card-id="${cardId}"]`);
+    if (tile) tile.classList.add('uploading');
+    uploadFile(file, (loaded, total) => {
+      job.loaded = loaded; job.total = total;
+      const bar = document.getElementById('upload-bar-' + job.key);
+      if (bar) bar.style.width = Math.round(100 * loaded / total) + '%';
+    }).then(meta => {
+      const result = getCard(boardId, cardId);
+      if (!result) { showToast(`Card is gone; ${file.name} not attached`, 'error'); return; }
+      result.card.attachments = result.card.attachments || [];
+      result.card.attachments.push(attachmentFromUpload(meta));
+      saveState();
+      if (!currentModalCard || currentModalCard.cardId !== cardId) {
+        showToast(`Attached ${meta.name} to "${result.card.title}"`, 'success');
+      }
+    }).catch(err => {
+      showToast(`${file.name}: ${err.message}`, 'error');
+    }).finally(() => {
+      pendingUploads.splice(pendingUploads.indexOf(job), 1);
+      refreshModalAttachments(cardId);
+      // Board tile badge count (and drop the uploading pulse) once its last
+      // upload settles — but never re-render mid-drag or under a half-typed
+      // new card; the next render picks the count up instead.
+      const ae = document.activeElement;
+      const typing = ae && !document.getElementById('modal-dialog').contains(ae)
+        && (ae.isContentEditable || ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA');
+      if (!pendingUploads.some(u => u.cardId === cardId) && state.view === 'board' && !typing
+          && !(typeof dragActive === 'function' && dragActive())) renderBoard();
+    });
+  }
+  refreshModalAttachments(cardId);
+}
+
+let _lastRemovedAttachment = null; // { boardId, cardId, index, attachment } — one-step undo
+
+function removeAttachment(boardId, cardId, attachmentId) {
   const result = getCard(boardId, cardId);
   if (!result) return;
-  result.card.attachments.push({
-    id: generateId(), name: names[i],
-    type: names[i].split('.').pop(), size: sizes[i],
-    timestamp: Date.now()
-  });
+  const index = result.card.attachments.findIndex(a => a.id === attachmentId);
+  if (index === -1) return;
+  // Only the reference goes; the file stays on disk, so Undo, card copies and
+  // comments that link it keep working.
+  const [attachment] = result.card.attachments.splice(index, 1);
+  _lastRemovedAttachment = { boardId, cardId, index, attachment };
   saveState();
-  renderCardModal();
-  showToast('Attachment added', 'success');
+  refreshModalAttachments(cardId);
+  showToast('Attachment deleted', 'info', { label: 'Undo', onClick: 'undoRemoveAttachment()' });
+}
+
+function undoRemoveAttachment() {
+  if (!_lastRemovedAttachment) return;
+  const { boardId, cardId, index, attachment } = _lastRemovedAttachment;
+  _lastRemovedAttachment = null;
+  const result = getCard(boardId, cardId);
+  if (!result) return;
+  result.card.attachments.splice(Math.min(index, result.card.attachments.length), 0, attachment);
+  saveState();
+  refreshModalAttachments(cardId);
+}
+
+// ----- Into a comment / description: markdown at the cursor -----
+function markdownForUpload(meta) {
+  const label = meta.name.replace(/[\[\]]/g, '');
+  return INLINE_IMAGE_TYPES.test(meta.mime) ? `![${label}](${meta.url})` : `[${label}](${meta.url})`;
+}
+
+function insertIntoTextarea(ta, text) {
+  const start = ta.selectionStart ?? ta.value.length;
+  const end = ta.selectionEnd ?? start;
+  const before = ta.value.slice(0, start);
+  const after = ta.value.slice(end);
+  const pre = before && !before.endsWith('\n') ? '\n' : '';
+  const post = after.startsWith('\n') ? '' : '\n';
+  ta.value = before + pre + text + post + after;
+  const caret = (before + pre + text + post).length;
+  ta.setSelectionRange(caret, caret);
+  ta.dispatchEvent(new Event('input')); // keeps commentDraft in step
+  if (ta.rows < 3) ta.rows = 3;
+}
+
+// Swap an upload's placeholder for its final text wherever it now lives: still
+// in an editor, in the stashed comment draft, or already saved into a comment
+// or the description (sent before the upload finished).
+function replaceUploadPlaceholder(boardId, cardId, placeholder, text) {
+  for (const id of ['comment-input', 'comment-edit', 'desc-edit']) {
+    const ta = document.getElementById(id);
+    if (ta && ta.value.includes(placeholder)) {
+      ta.value = ta.value.replace(placeholder, text);
+      if (id === 'comment-input') ta.dispatchEvent(new Event('input'));
+      return;
+    }
+  }
+  if (commentDraft.cardId === cardId && commentDraft.text.includes(placeholder)) {
+    commentDraft.text = commentDraft.text.replace(placeholder, text);
+    return;
+  }
+  const result = getCard(boardId, cardId);
+  if (!result) return;
+  const c = result.card.comments.find(c => (c.text || '').includes(placeholder));
+  if (c) c.text = c.text.replace(placeholder, text);
+  else if ((result.card.description || '').includes(placeholder)) result.card.description = result.card.description.replace(placeholder, text);
+  else return; // the placeholder was deleted by hand: leave the text alone
+  saveState();
+  if (currentModalCard && currentModalCard.cardId === cardId && !liveUpdatesBusy()) renderCardModal();
+}
+
+function insertFilesIntoText(ta, boardId, cardId, files) {
+  files = rejectOversized(files);
+  for (const file of files) {
+    const placeholder = `![Uploading ${file.name.replace(/[\[\]]/g, '')}…]()`;
+    insertIntoTextarea(ta, placeholder);
+    uploadFile(file)
+      .then(meta => replaceUploadPlaceholder(boardId, cardId, placeholder, markdownForUpload(meta)))
+      .catch(err => {
+        showToast(`${file.name}: ${err.message}`, 'error');
+        replaceUploadPlaceholder(boardId, cardId, placeholder, '');
+      });
+  }
+  ta.focus();
+}
+
+// ----- Drag & drop / paste wiring -----
+const TEXT_DROP_IDS = ['comment-input', 'comment-edit', 'desc-edit'];
+
+function fileDragTarget(target) {
+  const modalOpen = !document.getElementById('modal-overlay').classList.contains('hidden');
+  if (modalOpen && currentModalCard) {
+    const ta = target.closest && target.closest('textarea');
+    if (ta && TEXT_DROP_IDS.includes(ta.id)) return { kind: 'text', el: ta };
+    return { kind: 'modal', el: document.getElementById('modal-dialog') };
+  }
+  const tile = state.view === 'board' && target.closest && target.closest('.card[data-card-id]');
+  if (tile) return { kind: 'tile', el: tile };
+  return null;
+}
+
+let _fileDropEl = null;
+function setFileDropHighlight(el) {
+  if (_fileDropEl === el) return;
+  if (_fileDropEl) _fileDropEl.classList.remove('file-drop-over');
+  _fileDropEl = el;
+  if (!el) return;
+  el.classList.add('file-drop-over');
+  // A long card scrolls, so put the "Drop files" label in the visible middle
+  // of the dialog rather than the middle of its full height.
+  if (el.id === 'modal-dialog') {
+    const r = el.getBoundingClientRect();
+    const mid = window.innerHeight / 2 - r.top;
+    el.style.setProperty('--drop-label-top', Math.max(40, Math.min(r.height - 40, mid)) + 'px');
+  }
+}
+
+function initFileDrops() {
+  const isFileDrag = e => e.dataTransfer && [...(e.dataTransfer.types || [])].includes('Files');
+
+  // Gate on 'Files' so the card/list drag handlers in initDragDrop keep sole
+  // ownership of internal drags. preventDefault on every file drag so a drop that
+  // misses a target doesn't navigate the tab away to the file.
+  document.addEventListener('dragover', e => {
+    if (!isFileDrag(e)) return;
+    e.preventDefault();
+    const t = fileDragTarget(e.target);
+    e.dataTransfer.dropEffect = t ? 'copy' : 'none';
+    setFileDropHighlight(t ? t.el : null);
+  });
+  document.addEventListener('dragleave', e => {
+    if (isFileDrag(e) && !e.relatedTarget) setFileDropHighlight(null); // left the window
+  });
+  document.addEventListener('drop', e => {
+    if (!isFileDrag(e)) return;
+    e.preventDefault();
+    setFileDropHighlight(null);
+    const files = [...(e.dataTransfer.files || [])];
+    const t = fileDragTarget(e.target);
+    if (!t || !files.length) return;
+    if (t.kind === 'text') {
+      insertFilesIntoText(t.el, currentModalCard.boardId, currentModalCard.cardId, files);
+    } else if (t.kind === 'modal') {
+      attachFiles(currentModalCard.boardId, currentModalCard.cardId, files);
+    } else {
+      attachFiles(state.currentBoardId, t.el.dataset.cardId, files);
+    }
+  });
+
+  // Paste with the card open: into a comment/description editor → inline link;
+  // anywhere else that isn't a text field → attachment. A paste that also carries
+  // text (cells from a spreadsheet come with a picture of themselves) stays a
+  // normal text paste.
+  document.addEventListener('paste', e => {
+    if (!currentModalCard || document.getElementById('modal-overlay').classList.contains('hidden')) return;
+    const raw = [...(e.clipboardData && e.clipboardData.files || [])];
+    // Finder-copied files come with their own name as the text; that's not a
+    // real text paste.
+    const text = e.clipboardData.getData('text/plain').trim();
+    if (!raw.length || (text && !raw.some(f => f.name === text))) return;
+    const files = raw.map(namePastedFile);
+    const ae = document.activeElement;
+    const { boardId, cardId } = currentModalCard;
+    if (ae && TEXT_DROP_IDS.includes(ae.id)) {
+      e.preventDefault();
+      insertFilesIntoText(ae, boardId, cardId, files);
+    } else if (!(ae && (ae.isContentEditable || ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA'))) {
+      e.preventDefault();
+      attachFiles(boardId, cardId, files);
+    }
+  });
 }
 
 function copyCard(boardId, cardId) {
@@ -1591,6 +2194,10 @@ function copyCard(boardId, cardId) {
   copy.id = generateId();
   copy.title = copy.title + ' (copy)';
   copy.createdAt = Date.now();
+  // The copy is yours, even of an agent's card: the agent API lets an agent
+  // delete only cards it created, and a copy isn't an auto-logged ship.
+  copy.createdBy = state.currentUser.id;
+  copy.origin = null;
   result.list.cards.push(copy);
   saveState();
   renderBoard();
@@ -2073,6 +2680,30 @@ function toggleSidebar() {
   document.getElementById('sidebar').classList.toggle('collapsed');
 }
 
+function closeSidebar() {
+  document.getElementById('sidebar').classList.add('collapsed');
+}
+
+// Mobile menu parity with the task app: tap the backdrop or drag the panel
+// left to close it. Both are close-only — opening stays on the hamburger — and
+// only matter on phones, where the sidebar floats over the board as an overlay.
+function initSidebarMobile() {
+  // On a phone, start with the menu closed — the screen is barely one board
+  // wide, so leaving it open over the content on load just gets in the way.
+  if (window.innerWidth <= 900) closeSidebar();
+
+  document.getElementById('sidebar-overlay').addEventListener('click', closeSidebar);
+
+  // The panel follows the finger and settles on release (shared/drawer-drag.js).
+  attachDrawerDrag({
+    panel: '#sidebar',
+    backdrop: '#sidebar-overlay',
+    isActive: () => window.innerWidth <= 900 &&
+      !document.getElementById('sidebar').classList.contains('collapsed'),
+    close: closeSidebar,
+  });
+}
+
 // ===== DRAG & DROP =====
 let dragState = { cardId: null, fromListId: null, placeholder: null, lastListId: null, lastIndex: -1 };
 
@@ -2190,6 +2821,23 @@ function initDragDrop() {
     if (!listDragState.listId) return;
     handleListDrop(e);
   });
+
+  // Sidebar board → project folder, gated the same way.
+  document.addEventListener('dragover', e => {
+    if (!sidebarDrag.boardId) return;
+    handleSidebarDragOver(e);
+  });
+
+  document.addEventListener('drop', e => {
+    if (!sidebarDrag.boardId) return;
+    handleSidebarDrop(e);
+  });
+
+  // Safety net: a fresh press means any drag is over, even one whose dragend
+  // never arrived. Otherwise dragActive() would hold live updates off for good.
+  document.addEventListener('pointerdown', () => {
+    if (sidebarDrag.boardId) cleanupSidebarDrag();
+  }, true);
 }
 
 function cleanupDrag() {
@@ -2272,6 +2920,127 @@ function cleanupListDrag() {
   listDragState = { listId: null, placeholder: null, lastIndex: -1 };
 }
 
+// ----- SIDEBAR BOARD DRAG: file a board into a project folder -----
+// Drag any board in the sidebar onto a project folder (its header, or the boards
+// under it when it's open) to file it there, or onto Uncategorised to take it
+// back out. Collapsed folders take drops and stay shut, which is how old
+// projects get tidied away. The board menu's "Move to project" does the same.
+let sidebarDrag = { boardId: null, zone: null, x: 0, y: 0, raf: null };
+let _lastBoardFiling = null; // { boardId, projectId } that Undo puts back
+
+function onSidebarBoardDragStart(e, boardId) {
+  const item = e.currentTarget;
+  cleanupSidebarDrag(); // stop a previous drag's scroll loop if its dragend never came
+  sidebarDrag.boardId = boardId;
+  e.dataTransfer.effectAllowed = 'move';
+  e.dataTransfer.setData('text/plain', boardId); // Firefox won't start a drag without data
+  // Restyle after the browser has taken the drag image, so the ghost isn't faded.
+  requestAnimationFrame(() => {
+    if (sidebarDrag.boardId === boardId) item.classList.add('dragging');
+  });
+  startSidebarAutoScroll();
+}
+
+function onSidebarBoardDragEnd() {
+  cleanupSidebarDrag();
+}
+
+// The section a drop on `target` would file the board into, or null when it
+// wouldn't move it: outside every section, or the section it's already in.
+function sidebarDropZone(target) {
+  const el = target && (target.nodeType === 1 ? target : target.parentElement);
+  const zone = el && el.closest('#sidebar-nav [data-drop-project]');
+  if (!zone) return null;
+  const board = getBoard(sidebarDrag.boardId);
+  if (!board || (board.projectId || '') === zone.dataset.dropProject) return null;
+  return zone;
+}
+
+function setSidebarDropZone(zone) {
+  if (sidebarDrag.zone === zone) return;
+  if (sidebarDrag.zone) sidebarDrag.zone.classList.remove('drop-over');
+  sidebarDrag.zone = zone;
+  if (zone) zone.classList.add('drop-over');
+}
+
+function handleSidebarDragOver(e) {
+  // Always cancel, so nothing else on the page (the search box, say) takes the
+  // drop; dropEffect 'none' then refuses it anywhere that isn't a target.
+  e.preventDefault();
+  sidebarDrag.x = e.clientX;
+  sidebarDrag.y = e.clientY;
+  const zone = sidebarDropZone(e.target);
+  e.dataTransfer.dropEffect = zone ? 'move' : 'none';
+  setSidebarDropZone(zone);
+}
+
+function handleSidebarDrop(e) {
+  e.preventDefault();
+  const zone = sidebarDropZone(e.target);
+  const boardId = sidebarDrag.boardId;
+  cleanupSidebarDrag();
+  if (zone) fileBoardInProject(boardId, zone.dataset.dropProject || null);
+}
+
+function cleanupSidebarDrag() {
+  if (sidebarDrag.raf) cancelAnimationFrame(sidebarDrag.raf);
+  if (sidebarDrag.zone) sidebarDrag.zone.classList.remove('drop-over');
+  document.querySelectorAll('.sidebar-item.dragging').forEach(el => el.classList.remove('dragging'));
+  sidebarDrag = { boardId: null, zone: null, x: 0, y: 0, raf: null };
+}
+
+// Scroll the sidebar while a dragged board is held near its top or bottom edge,
+// so folders below the fold are reachable. Uses the last pointer position from
+// dragover, which stops firing while the pointer holds still.
+function startSidebarAutoScroll() {
+  const EDGE = 48;      // px from the nav's top/bottom where scrolling kicks in
+  const MAX_SPEED = 14; // px per frame at (or past) the very edge
+  const step = () => {
+    if (!sidebarDrag.boardId) { sidebarDrag.raf = null; return; }
+    const nav = document.getElementById('sidebar-nav');
+    const { x, y } = sidebarDrag;
+    if (nav && (x || y)) {
+      const r = nav.getBoundingClientRect();
+      if (x >= r.left && x <= r.right) {
+        let dy = 0;
+        if (y < r.top + EDGE) dy = -MAX_SPEED * Math.min(1, (r.top + EDGE - y) / EDGE);
+        else if (y > r.bottom - EDGE) dy = MAX_SPEED * Math.min(1, (y - (r.bottom - EDGE)) / EDGE);
+        if (dy) nav.scrollTop += dy;
+      }
+    }
+    sidebarDrag.raf = requestAnimationFrame(step);
+  };
+  sidebarDrag.raf = requestAnimationFrame(step);
+}
+
+function fileBoardInProject(boardId, projectId) {
+  const board = getBoard(boardId);
+  if (!board || (board.projectId || null) === projectId) return;
+  _lastBoardFiling = { boardId, projectId: board.projectId || null };
+  setBoardProject(boardId, projectId);
+  refreshAfterFiling();
+  const project = projectId && state.projects.find(p => p.id === projectId);
+  showToast(`Moved "${board.title}" to ${project ? project.name : 'Uncategorised'}`, 'success',
+    { label: 'Undo', onClick: 'undoBoardFiling()' });
+}
+
+function undoBoardFiling() {
+  if (!_lastBoardFiling) return;
+  const { boardId, projectId } = _lastBoardFiling;
+  _lastBoardFiling = null;
+  // If that project was deleted meanwhile, the board goes back to Uncategorised.
+  setBoardProject(boardId, state.projects.some(p => p.id === projectId) ? projectId : null);
+  document.querySelectorAll('#toast-container .toast').forEach(t => t.remove());
+  refreshAfterFiling();
+}
+
+// Only the sidebar and the dashboard group boards by project, so an open board
+// is left alone.
+function refreshAfterFiling() {
+  renderSidebar();
+  if (state.view === 'dashboard') renderDashboard();
+}
+
 // ----- Edge auto-scroll while dragging a card or list -----
 // HTML5 dragover only fires on pointer movement, so holding a dragged card
 // against the edge wouldn't scroll. This rAF loop keeps scrolling the board
@@ -2280,7 +3049,7 @@ function cleanupListDrag() {
 let autoScroll = { raf: null, x: 0, y: 0 };
 
 function dragActive() {
-  return !!(dragState.cardId || listDragState.listId);
+  return !!(dragState.cardId || listDragState.listId || sidebarDrag.boardId);
 }
 
 function startAutoScroll() {
@@ -2476,11 +3245,13 @@ async function init() {
     history.replaceState(null, '', location.pathname);
   }
   initDragDrop();
+  initFileDrops();
   initBoardPan();
   initSearch();
   initKeyboard();
   initModalEvents();
   initMobileNav();
+  initSidebarMobile();
   // Live updates: the SSE stream carries writes within a few hundred ms. Poll
   // every 2s only while that stream is down, and every 20s regardless as a
   // safety net against a stream a proxy is holding open but no longer feeding.
@@ -2498,6 +3269,7 @@ async function init() {
     pollForUpdates();
   });
   window.addEventListener('focus', () => { scheduleApply(); pollForUpdates(); });
+  if (hasOffline()) PBOffline.onReconnect(() => _offline || _offlineDirty || _noBaseline, syncNow, 5000);
 
   // Sidebar toggle
   document.getElementById('sidebar-toggle').addEventListener('click', toggleSidebar);

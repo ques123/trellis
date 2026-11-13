@@ -12,7 +12,7 @@ process.env.TRELLIS_AGENT_TOKEN_CODEX = 'codex-token';
 // --- in-memory state + db stub (injected before the router is required) ---
 function sampleState() {
   return {
-    users: [{ id: 'u1', name: 'Chris' }],
+    users: [{ id: 'u1', name: 'Owner' }],
     projects: [{ id: 'p1', name: 'Engineering' }],
     boards: [{
       id: 'b1', title: 'pbrain', projectId: 'p1', starred: true,
@@ -221,6 +221,58 @@ const call = async (method, path, body, headers = H) => {
   ok('DELETE adds a delete notification');
   assert.equal((await call('DELETE', '/api/trellis/agent/cards/ghost')).status, 404);
   ok('DELETE 404s unknown card');
+
+  // --- board creation ---
+  assert.equal((await call('POST', '/api/trellis/agent/boards', {})).status, 400);
+  assert.equal((await call('POST', '/api/trellis/agent/boards', { title: 'x', lists: [] })).status, 400);
+  ok('POST /boards 400s without a title or with empty lists');
+  r = await call('POST', '/api/trellis/agent/boards', { title: 'New Project' });
+  assert.equal(r.status, 201);
+  assert.equal(r.json.created, true);
+  assert.deepEqual(r.json.board.lists.map(l => l.title), ['backlog', 'to do', 'doing', 'QC', 'done']);
+  assert.equal(STATE.boards[0].id, r.json.board.id);
+  assert.deepEqual(STATE.boards[0].members, []);
+  const newBoardId = r.json.board.id;
+  ok('POST /boards creates a board with backlog / to do / doing / QC / done at the top');
+  r = await call('POST', '/api/trellis/agent/boards', { title: '  new project ' });
+  assert.equal(r.status, 200);
+  assert.equal(r.json.created, false);
+  assert.equal(r.json.board.id, newBoardId);
+  assert.equal(STATE.boards.filter(b => b.title.toLowerCase() === 'new project').length, 1);
+  ok('POST /boards is idempotent by title (case/space-insensitive)');
+  r = await call('POST', '/api/trellis/agent/boards', { title: 'Custom', lists: ['Backlog', 'Doing', 'Done'] });
+  assert.equal(r.status, 201);
+  assert.deepEqual(r.json.board.lists.map(l => l.title), ['Backlog', 'Doing', 'Done']);
+  ok('POST /boards accepts custom list titles');
+  r = await call('POST', '/api/trellis/agent/cards', { boardId: newBoardId, listId: r.json.board.lists[0].id, title: 'wrong board' });
+  assert.equal(r.status, 404);
+  ok('a new board\'s lists are scoped to it');
+
+  // --- list creation (backfilling backlog / QC on an existing board) ---
+  assert.equal((await call('POST', '/api/trellis/agent/boards/ghost/lists', { title: 'QC' })).status, 404);
+  assert.equal((await call('POST', '/api/trellis/agent/boards/b1/lists', {})).status, 400);
+  assert.equal((await call('POST', '/api/trellis/agent/boards/b1/lists', { title: 'QC', position: -1 })).status, 400);
+  ok('POST /boards/:id/lists 404s unknown board, 400s bad input');
+  const titles = () => STATE.boards.find(b => b.id === 'b1').lists.slice().sort((a, b) => a.position - b.position).map(l => l.title);
+  const before = titles();
+  r = await call('POST', '/api/trellis/agent/boards/b1/lists', { title: 'QC', position: before.length - 1 });
+  assert.equal(r.status, 201);
+  assert.deepEqual(titles(), [...before.slice(0, -1), 'QC', before[before.length - 1]]);
+  assert.deepEqual(r.json.board.lists.map(l => l.title), titles());
+  ok('POST /boards/:id/lists inserts QC before the last column and renumbers');
+  r = await call('POST', '/api/trellis/agent/boards/b1/lists', { title: 'Backlog', position: 0 });
+  assert.equal(r.status, 201);
+  assert.equal(titles()[0], 'Backlog');
+  assert.deepEqual(STATE.boards.find(b => b.id === 'b1').lists.map(l => l.position).sort(), titles().map((_, i) => i));
+  ok('POST /boards/:id/lists puts backlog first');
+  r = await call('POST', '/api/trellis/agent/boards/b1/lists', { title: 'qc', position: 0 });
+  assert.equal(r.status, 200);
+  assert.equal(r.json.created, false);
+  assert.equal(titles().filter(t => t.toLowerCase() === 'qc').length, 1);
+  ok('POST /boards/:id/lists is idempotent by title');
+  r = await call('POST', '/api/trellis/agent/boards/b1/lists', { title: 'Later' });
+  assert.equal(titles()[titles().length - 1], 'Later');
+  ok('POST /boards/:id/lists defaults to the end');
 
   // --- multi-agent identity (Codex) ---
   // a different token resolves to a different agent identity

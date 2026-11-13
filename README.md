@@ -4,7 +4,9 @@ A self-hosted Kanban board (Trello-style) with live multi-tab updates and a toke
 
 ## Features
 
-- **Boards / lists / cards** with drag & drop, labels, due dates, checklists, comments, attachments, members, board search, notifications.
+- **Boards / lists / cards** with drag & drop, labels, due dates, checklists, comments, members, board search, notifications, and project folders in the sidebar.
+- **File attachments**: drag, drop or paste files onto a card or into a comment (images show inline). Stored on disk in `data/trellis-uploads/`, 15 MB per file.
+- **Works offline**: a service worker caches the app, and each tab keeps a copy of the board in IndexedDB. Edits made offline sync on reconnect with a three-way merge, so changes an agent made meanwhile survive.
 - **Live updates over SSE** — every write is pushed to all open tabs as a small diff (a card move is a couple of KB, not the whole board), with automatic fallback to a full refetch on version skew.
 - **Optimistic concurrency** — the whole-state PUT carries a version; a stale tab gets a 409 with the authoritative state and reconciles instead of clobbering.
 - **State history** — every write archives the previous state (last 30 kept), so any mistake is a one-query restore.
@@ -19,7 +21,7 @@ A self-hosted Kanban board (Trello-style) with live multi-tab updates and a toke
 
 ```bash
 npm install
-cp .env.example .env   # fill in DATABASE_URL, ALLOWED_EMAIL, and a password hash
+cp .env.example .env   # fill in DATABASE_URL, ALLOWED_EMAIL, OWNER_NAME and a password hash
 node scripts/hash-password.js 'your password'   # → paste output into .env
 npm start
 ```
@@ -28,25 +30,17 @@ Sign in at `http://localhost:3000` with the password, or via a magic link (set `
 
 ## Agent API
 
-Set `TRELLIS_AGENT_TOKEN` in `.env`, then:
+AI agents (Claude Code, Codex, scripts) work the board through a separate
+token-authenticated API: create boards and cards, move cards, comment, and pick
+up cards assigned to them. Writes are atomic, so agent and browser edits never
+overwrite each other.
 
 ```bash
 curl -H "Authorization: Bearer $TRELLIS_AGENT_TOKEN" localhost:3000/api/trellis/agent/boards
 ```
 
-| Endpoint | What it does |
-|---|---|
-| `GET /boards` | Compact index of every board |
-| `GET /boards/:id` | One board, lists with summarized cards |
-| `GET /cards/:id` | Full card incl. comments & checklists |
-| `GET /assigned` | Cards where this agent is a member (its task inbox) |
-| `POST /cards` | Create a card (`boardId`, `listId`, `title`, …) |
-| `PATCH /cards/:id` | Update title/description/labels/due date |
-| `POST /cards/:id/move` | Move to another list (`listId`, `position?`) |
-| `POST /cards/:id/comments` | Comment as the agent |
-| `DELETE /cards/:id` | Delete — only cards the agent itself created |
-
-All under `/api/trellis/agent`. Writes are atomic (row-locked transaction), so agent and UI edits never clobber each other.
+Full reference, including how to connect Claude Code: **[docs/AGENT_API.md](docs/AGENT_API.md)**.
+A ready-made Claude Code skill is in [`skills/trellis/SKILL.md`](skills/trellis/SKILL.md).
 
 ## Tests
 
@@ -66,3 +60,6 @@ location /api/trellis/events {
     proxy_read_timeout 3600s;
 }
 ```
+
+Uploads need nginx to accept files up to 15 MB: `client_max_body_size 15M;`.
+Keep `data/` (uploads) and `.env` out of deploys that overwrite the app folder.

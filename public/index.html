@@ -37,6 +37,8 @@
       <header id="topbar" class="topbar"></header>
       <div id="view-container" class="view-container"></div>
     </main>
+    <!-- Backdrop behind the sidebar on phones: tap to close, matching the task app. -->
+    <div id="sidebar-overlay" class="sidebar-overlay"></div>
   </div>
 
   <div id="modal-overlay" class="modal-overlay hidden">
@@ -66,6 +68,13 @@
     </button>
   </div>
 
+  <script src="/shared/drawer-drag.js"></script>
+  <script src="/shared/offline.js"></script>
+  <script src="/shared/trellis-merge.js"></script>
+  <script src="/config.js"></script>
   <script src="app.js"></script>
+  <script>
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
+  </script>
 </body>
 </html>

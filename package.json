@@ -5,7 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node scripts/test-trellis-agent.js && node scripts/test-trellis-concurrency.js && node scripts/test-trellis-dedup.js"
+    "test": "for t in scripts/test-*.js; do node $t || exit 1; done"
   },
   "dependencies": {
     "cookie-parser": "^1.4.7",
